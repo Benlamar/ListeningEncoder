@@ -119,10 +119,11 @@ def main():
     parser.add_argument("--train_data", default="data/gatekeeper_train.jsonl")
     parser.add_argument("--eval_data", default="data/gatekeeper_eval.jsonl")
     parser.add_argument("--output_dir", default="checkpoints/gatekeeper_model")
-    parser.add_argument("--epochs", type=int, default=3)
-    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--epochs", type=int, default=2)
+    parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=3e-5)
     parser.add_argument("--max_length", type=int, default=160)
+    parser.add_argument("--save_steps", type=int, default=500, help="Save a checkpoint every N steps")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
@@ -181,8 +182,9 @@ def main():
         learning_rate=args.lr,
         weight_decay=0.01,
         eval_strategy="epoch",
-        save_strategy="epoch",
-        save_total_limit=2,
+        save_strategy="steps",
+        save_steps=args.save_steps,
+        save_total_limit=3,
         load_best_model_at_end=True,
         metric_for_best_model="macro_f1",
         greater_is_better=True,
@@ -214,9 +216,19 @@ def main():
         **trainer_kwargs
     )
 
-    # 6. Train & Evaluate
-    print("\nStarting Training...")
-    trainer.train()
+    # 6. Train & Evaluate (with Automatic Checkpoint Resumption)
+    from transformers.trainer_utils import get_last_checkpoint
+    last_checkpoint = None
+    if os.path.isdir(args.output_dir):
+        last_checkpoint = get_last_checkpoint(args.output_dir)
+
+    if last_checkpoint is not None:
+        print(f"\n[AUTO-RESUME] Found existing checkpoint: {last_checkpoint}")
+        print("Resuming training from this checkpoint (NOT restarting from scratch)...")
+        trainer.train(resume_from_checkpoint=last_checkpoint)
+    else:
+        print("\nStarting Training from scratch...")
+        trainer.train()
 
     print("\nEvaluating on Validation Set...")
     eval_results = trainer.evaluate()
