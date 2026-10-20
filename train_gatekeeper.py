@@ -143,7 +143,8 @@ def main():
         args.model_name,
         num_labels=4,
         id2label={i: name for i, name in enumerate(LABEL_NAMES)},
-        label2id={name: i for i, name in enumerate(LABEL_NAMES)}
+        label2id={name: i for i, name in enumerate(LABEL_NAMES)},
+        attn_implementation="sdpa"  # Native PyTorch FlashAttention, fully compatible with ARM64 / Grace Hopper
     )
 
     # 3. Load Datasets

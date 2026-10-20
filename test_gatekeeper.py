@@ -131,7 +131,11 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Loading checkpoint '{args.checkpoint}' on {device.upper()}...")
     tokenizer = AutoTokenizer.from_pretrained(args.checkpoint)
-    model = AutoModelForSequenceClassification.from_pretrained(args.checkpoint, num_labels=4).to(device)
+    model = AutoModelForSequenceClassification.from_pretrained(
+        args.checkpoint,
+        num_labels=4,
+        attn_implementation="sdpa"
+    ).to(device)
     model.eval()
 
     if args.benchmark:
