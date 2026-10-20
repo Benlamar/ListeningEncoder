@@ -41,12 +41,19 @@ To generate a fast smoke-test set (~13,000 rows):
 uv run python prepare_gatekeeper_dataset.py --smoke-test
 ```
 
-### Option B: Download External Hugging Face Turn-Taking Datasets
-To inspect or augment with open benchmarks (`ASLP-lab/Easy-Turn-Testset`, `besimple-ai/duplex-cue`):
+### Option B: Download External Hugging Face Datasets
+To inspect or fetch open benchmarks (`besimple-ai/duplex-cue`):
 ```bash
 uv run python download_hf_datasets.py
 ```
 *Outputs to:* `data/hf_downloads/`
+
+### Option C: Prepare Duplex-Cue (Real Human Conversation Benchmark)
+Converts 8 natural two-person spoken dialogues (~24,000 slices) with human-annotated interruptions and backchannels:
+```bash
+uv run python prepare_duplexcue_dataset.py
+```
+*Outputs to:* `data/duplexcue_benchmark.jsonl`
 
 ---
 

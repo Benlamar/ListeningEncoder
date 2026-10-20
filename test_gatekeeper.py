@@ -121,11 +121,44 @@ def interactive_mode(model, tokenizer, device):
             break
 
 
+def evaluate_file(file_path: str, model, tokenizer, device, max_samples: int = None):
+    import json
+    from sklearn.metrics import classification_report, confusion_matrix
+    print(f"\nEvaluating model against: {file_path}")
+    y_true = []
+    y_pred = []
+    count = 0
+
+    with open(file_path, "r", encoding="utf-8") as f:
+        for line in f:
+            if not line.strip():
+                continue
+            item = json.loads(line)
+            text = item.get("text", "")
+            lbl = item.get("label", 0)
+            pred_class, _ = predict(text, model, tokenizer, device)
+            y_true.append(lbl)
+            y_pred.append(pred_class)
+            count += 1
+            if max_samples and count >= max_samples:
+                break
+            if count % 1000 == 0:
+                print(f"  Evaluated {count} samples...")
+
+    print(f"\nCompleted evaluation on {count:,} samples.")
+    target_names = [LABEL_NAMES[i] for i in range(4)]
+    print("\n" + classification_report(y_true, y_pred, target_names=target_names, digits=4, zero_division=0))
+    print("Confusion Matrix (Rows: True, Cols: Pred):")
+    print(confusion_matrix(y_true, y_pred))
+
+
 def main():
     parser = argparse.ArgumentParser(description="Test trained gatekeeper model.")
     parser.add_argument("--checkpoint", default="answerdotai/ModernBERT-base",
                         help="Path to trained checkpoint or HF model ID")
     parser.add_argument("--benchmark", action="store_true", help="Run automated benchmark scenarios")
+    parser.add_argument("--eval-file", default=None, help="Path to JSONL file to evaluate (e.g. data/duplexcue_benchmark.jsonl)")
+    parser.add_argument("--max-samples", type=int, default=None, help="Limit number of eval samples")
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -138,7 +171,9 @@ def main():
     ).to(device)
     model.eval()
 
-    if args.benchmark:
+    if args.eval_file:
+        evaluate_file(args.eval_file, model, tokenizer, device, max_samples=args.max_samples)
+    elif args.benchmark:
         run_benchmarks(model, tokenizer, device)
     else:
         interactive_mode(model, tokenizer, device)
