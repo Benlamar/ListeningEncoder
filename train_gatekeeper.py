@@ -193,16 +193,25 @@ def main():
         report_to="none"
     )
 
-    # 5. Initialize Trainer
+    # 5. Initialize Trainer (compatible with Transformers 4.x and 5.x)
+    import inspect
+    trainer_kwargs = {
+        "model": model,
+        "args": training_args,
+        "train_dataset": tokenized_datasets["train"],
+        "eval_dataset": tokenized_datasets["eval"],
+        "data_collator": DataCollatorWithPadding(tokenizer=tokenizer),
+        "compute_metrics": compute_metrics,
+    }
+    trainer_params = inspect.signature(Trainer.__init__).parameters
+    if "processing_class" in trainer_params:
+        trainer_kwargs["processing_class"] = tokenizer
+    elif "tokenizer" in trainer_params:
+        trainer_kwargs["tokenizer"] = tokenizer
+
     trainer = WeightedTrainer(
         class_weights=class_weights,
-        model=model,
-        args=training_args,
-        train_dataset=tokenized_datasets["train"],
-        eval_dataset=tokenized_datasets["eval"],
-        tokenizer=tokenizer,
-        data_collator=DataCollatorWithPadding(tokenizer=tokenizer),
-        compute_metrics=compute_metrics,
+        **trainer_kwargs
     )
 
     # 6. Train & Evaluate
