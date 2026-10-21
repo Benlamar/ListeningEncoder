@@ -16,10 +16,10 @@ import os
 import tarfile
 import json
 import argparse
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Tuple
 
 LABEL_NAMES = {0: "LISTEN", 1: "SPEAK", 2: "FILLER", 3: "INTERRUPT"}
-BACKCHANNEL_WORDS = {"yeah", "uh-huh", "mm-hm", "right", "okay", "yep", "sure", "mhm", "cool"}
+BACKCHANNEL_WORDS = {"yeah", "uh-huh", "mm-hm", "right", "okay", "yep", "sure", "mhm", "cool", "got it"}
 
 
 def extract_openyap_tar_if_needed(sample_tar: str, extract_dir: str):
@@ -34,7 +34,54 @@ def extract_openyap_tar_if_needed(sample_tar: str, extract_dir: str):
     print("Extraction complete.")
 
 
-def load_words(json_path: str) -> List[Dict[str, Any]]:
+def extract_words_from_deepgram_or_raw(data: Any) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """
+    Extracts (words_track_a, words_track_b) from whatever schema OpenYap provides:
+    1. Multi-channel deepgram: results.channels[0] & results.channels[1]
+    2. Diarized words: words with speaker: 0 and speaker: 1
+    3. Flat word lists
+    """
+    words_a = []
+    words_b = []
+
+    if isinstance(data, dict):
+        # Format A: Deepgram channels object
+        channels = data.get("results", {}).get("channels", [])
+        if len(channels) >= 2:
+            alt_a = channels[0].get("alternatives", [{}])[0].get("words", [])
+            alt_b = channels[1].get("alternatives", [{}])[0].get("words", [])
+            return alt_a, alt_b
+        elif len(channels) == 1:
+            alt = channels[0].get("alternatives", [{}])[0].get("words", [])
+            # Check speaker tags
+            for w in alt:
+                spk = w.get("speaker", 0)
+                if spk == 0:
+                    words_a.append(w)
+                else:
+                    words_b.append(w)
+            if words_a or words_b:
+                return words_a, words_b
+
+        # Format B: Direct words list with speaker field
+        words = data.get("words", [])
+        if words and isinstance(words, list):
+            for w in words:
+                spk = w.get("speaker", 0)
+                if spk == 0:
+                    words_a.append(w)
+                else:
+                    words_b.append(w)
+            return words_a, words_b
+
+        # Format C: Track a / b keys
+        if "track_a" in data and "track_b" in data:
+            return data["track_a"].get("words", []), data["track_b"].get("words", [])
+
+    return words_a, words_b
+
+
+def load_single_file_words(json_path: str) -> List[Dict[str, Any]]:
     if not os.path.exists(json_path):
         return []
     with open(json_path, "r", encoding="utf-8") as f:
@@ -43,7 +90,11 @@ def load_words(json_path: str) -> List[Dict[str, Any]]:
             if isinstance(data, list):
                 return data
             if isinstance(data, dict):
-                return data.get("words", [])
+                if "words" in data:
+                    return data["words"]
+                channels = data.get("results", {}).get("channels", [])
+                if channels:
+                    return channels[0].get("alternatives", [{}])[0].get("words", [])
         except Exception:
             return []
     return []
@@ -57,9 +108,15 @@ def process_dual_track_conv(user_words: List[Dict[str, Any]],
     if not user_words and not ai_words:
         return rows
 
-    # Normalize structure to have start, end, word
     def get_time(item, key, default):
-        return float(item.get(key, default))
+        val = item.get(key, default)
+        try:
+            return float(val)
+        except Exception:
+            return default
+
+    user_words = [w for w in user_words if w.get("word") or w.get("punctuated_word")]
+    ai_words = [w for w in ai_words if w.get("word") or w.get("punctuated_word")]
 
     user_words.sort(key=lambda x: get_time(x, "start", 0.0))
     ai_words.sort(key=lambda x: get_time(x, "start", 0.0))
@@ -93,15 +150,12 @@ def process_dual_track_conv(user_words: List[Dict[str, Any]],
         # Determine label
         # Case 1: AI is speaking and User cuts in
         if a_active and u_active and u_tick:
-            # Check if it's just a backchannel or actual barge-in
             is_backchannel = all(w.lower().strip(".,?!") in BACKCHANNEL_WORDS for w in u_tick)
             label = 2 if is_backchannel else 3
         # Case 2: AI is idle, user just finished speaking in previous tick and now silence
         elif not a_active and not u_active and user_history:
-            # If silence right after speech, potential turn completion (SPEAK)
             label = 1
         elif not a_active and u_active:
-            # User speaking
             label = 0
         else:
             label = 0
@@ -122,6 +176,14 @@ def process_dual_track_conv(user_words: List[Dict[str, Any]],
     return rows
 
 
+def find_all_files(root_dir: str) -> List[str]:
+    found = []
+    for root, _, files in os.walk(root_dir):
+        for f in files:
+            found.append(os.path.join(root, f))
+    return found
+
+
 def main():
     parser = argparse.ArgumentParser(description="Convert OpenYap 1K conversations to Gatekeeper training format.")
     parser.add_argument("--source-dir", default="data/hf_downloads/mrfakename_open-yap-1k")
@@ -135,36 +197,79 @@ def main():
 
     if not os.path.exists(conv_dir):
         print(f"Notice: Extracted OpenYap directory '{conv_dir}' not found.")
-        print(f"Run: uv run python download_hf_datasets.py --repo mrfakename/open-yap-1k")
+        print("Run: uv run python download_hf_datasets.py --repo mrfakename/open-yap-1k")
         return
 
-    print(f"Scanning {conv_dir} for dual-track conversations...")
+    all_files = find_all_files(conv_dir)
+    print(f"\nScanned '{conv_dir}': found {len(all_files):,} total files.")
+    print("Sample discovered files (first 8):")
+    for f in all_files[:8]:
+        rel = os.path.relpath(f, conv_dir)
+        print(f"  - {rel}")
+
+    json_files = [f for f in all_files if f.endswith(".json") or f.endswith(".jsonl")]
+    print(f"\nDiscovered {len(json_files):,} JSON/JSONL transcript files.")
+
     all_rows = []
-    # Process conversations
-    subdirs = [os.path.join(conv_dir, d) for d in os.listdir(conv_dir) if os.path.isdir(os.path.join(conv_dir, d))]
-    
-    count = 0
-    for sd in subdirs[:args.max_conversations]:
-        words_a = load_words(os.path.join(sd, "a_words.json")) or load_words(os.path.join(sd, "transcript_a.json"))
-        words_b = load_words(os.path.join(sd, "b_words.json")) or load_words(os.path.join(sd, "transcript_b.json"))
+    processed_convs = 0
 
-        if words_a and words_b:
-            # Perspective 1: A is AI, B is User
-            r1 = process_dual_track_conv(user_words=words_b, ai_words=words_a)
-            # Perspective 2: B is AI, A is User
-            r2 = process_dual_track_conv(user_words=words_a, ai_words=words_b)
-            all_rows.extend(r1)
-            all_rows.extend(r2)
-            count += 1
+    # Strategy 1: Look for combined multichannel or diarized JSON files
+    for jf in json_files:
+        if processed_convs >= args.max_conversations:
+            break
+        with open(jf, "r", encoding="utf-8") as f:
+            try:
+                data = json.load(f)
+                words_a, words_b = extract_words_from_deepgram_or_raw(data)
+                if words_a and words_b:
+                    r1 = process_dual_track_conv(user_words=words_b, ai_words=words_a)
+                    r2 = process_dual_track_conv(user_words=words_a, ai_words=words_b)
+                    all_rows.extend(r1)
+                    all_rows.extend(r2)
+                    processed_convs += 1
+                    print(f"  Processed multi-track file: {os.path.basename(jf)} (+{len(r1)+len(r2):,} ticks)")
+            except Exception:
+                pass
 
-    print(f"Converted {count} dual-perspective conversations into {len(all_rows):,} ticks.")
-    os.makedirs(os.path.dirname(args.output_file) or ".", exist_ok=True)
-    with open(args.output_file, "w", encoding="utf-8") as f:
-        for r in all_rows:
-            f.write(json.dumps(r) + "\n")
-    print(f"Saved to: {args.output_file}")
+    # Strategy 2: If no combined files, pair up separate files (e.g. *_a.json & *_b.json, or by folder)
+    if processed_convs == 0:
+        dir_groups = {}
+        for jf in json_files:
+            d = os.path.dirname(jf)
+            dir_groups.setdefault(d, []).append(jf)
+
+        for d, files in dir_groups.items():
+            if processed_convs >= args.max_conversations:
+                break
+            files.sort()
+            if len(files) >= 2:
+                words_a = load_single_file_words(files[0])
+                words_b = load_single_file_words(files[1])
+                if words_a and words_b:
+                    r1 = process_dual_track_conv(user_words=words_b, ai_words=words_a)
+                    r2 = process_dual_track_conv(user_words=words_a, ai_words=words_b)
+                    all_rows.extend(r1)
+                    all_rows.extend(r2)
+                    processed_convs += 1
+                    print(f"  Paired files in {os.path.basename(d)}: {os.path.basename(files[0])} & {os.path.basename(files[1])} (+{len(r1)+len(r2):,} ticks)")
+
+    print(f"\n============================================================")
+    print(f"Converted {processed_convs} dual-perspective conversations into {len(all_rows):,} ticks.")
+    print(f"============================================================")
+
+    if all_rows:
+        os.makedirs(os.path.dirname(args.output_file) or ".", exist_ok=True)
+        counts = {0: 0, 1: 0, 2: 0, 3: 0}
+        with open(args.output_file, "w", encoding="utf-8") as f:
+            for r in all_rows:
+                counts[r["label"]] += 1
+                fout_line = json.dumps(r)
+                f.write(fout_line + "\n")
+        print(f"Saved to: {args.output_file}")
+        for lbl in range(4):
+            pct = (counts[lbl] / len(all_rows) * 100) if all_rows else 0
+            print(f"  Class {lbl} ({LABEL_NAMES[lbl]:<10}): {counts[lbl]:,} ({pct:.2f}%)")
 
 
 if __name__ == "__main__":
     main()
-
