@@ -306,3 +306,118 @@ DECISION_POLICY = {
   - Apple M2 / M3 / M4 (MPS): **~6.8 ms**
   - Intel / AMD CPU (x86_64 AVX-512): **~14.5 ms**
 - **VRAM Footprint**: **~320 MB** (fits easily alongside any local LLM or TTS model).
+
+---
+
+## 8. Audio Slicing & Streaming Cadence (300 ms vs 600 ms)
+
+A frequent question in production full-duplex systems is:
+> *"Should my microphone and streaming STT slice audio every 300 ms or 600 ms?"*
+
+Here is the exact engineering breakdown and recommended implementation:
+
+### 300 ms vs 600 ms Comparison
+
+| Dimension | **300 ms Slicing** | **600 ms Slicing** |
+| :--- | :--- | :--- |
+| **Words delivered per slice** | ~0 to 1 word | ~1 to 3 words |
+| **Barge-in Reaction Time** | **Ultra-fast (~320 ms end-to-end)** | Moderate (~620 ms end-to-end) |
+| **Risk of False Turn Handoff** | High (humans routinely pause for 300 ms to breathe) | Low (600 ms represents an actual conversational pause) |
+| **STT Compute Overhead** | ~2× more frequent partial transcripts | Lower overhead |
+| **Best Used For** | **Barge-ins & Cut-in detection** (`INTERRUPT`) | **Turn Completion & Silence** (`SPEAK`) |
+
+---
+
+### The Recommended Production Strategy: The Dual-Cadence Rule
+
+In human conversation:
+- You want the AI to **stop talking instantly** the moment the user says *"Wait"* (within **300 ms**).
+- But you **do not** want the AI to jump in when the user simply pauses to inhale mid-sentence (a 300 ms pause is natural breathing).
+
+Therefore, the best production pipeline uses a **300 ms audio slice with a 2-tick silence counter**:
+
+```text
+Mic Stream (16 kHz Audio)
+   │
+   ▼
+Audio Slicer (Chunk every 300 ms / 4,800 audio samples)
+   │
+   ▼
+Streaming STT (Deepgram / Whisper Streaming / Moonshine)
+   │
+   ├──▶ Case A: Words heard while AI is SPEAKING (e.g. "Wait")
+   │    └── Run Gatekeeper IMMEDIATELY on 300 ms tick
+   │        └── If P(INTERRUPT) ≥ 0.50 ──▶ ABORT TTS IMMEDIATELY (<320 ms)!
+   │
+   └──▶ Case B: Silence heard while AI is IDLE ("<silence>")
+        └── Wait for 2 consecutive 300 ms ticks (= 600 ms total silence)
+            └── If P(SPEAK) ≥ 0.70 ──▶ DISPATCH TO LLM (User finished turn)!
+```
+
+---
+
+### Code Implementation: 300 ms Audio Slicer with 2-Tick Silence Rule
+
+Here is how to implement this in your microphone handler:
+
+```python
+import time
+
+class AudioCadenceController:
+    def __init__(self, gatekeeper):
+        self.gk = gatekeeper
+        self.consecutive_silence_ticks = 0
+        self.SLICE_DURATION_MS = 300  # 300 ms streaming chunks
+
+    def on_stt_slice_received(self, heard_text: str, ai_state: str, history: str):
+        """
+        Called every 300 ms as new audio/STT partials arrive.
+        """
+        is_silence = (not heard_text or heard_text == "<silence>")
+
+        # -------------------------------------------------------------
+        # 1. IMMEDIATE BARGE-IN CHECK (300 ms Latency)
+        # -------------------------------------------------------------
+        if ai_state.startswith("SPEAKING"):
+            if not is_silence:
+                # User blurted out words while AI speaks -> Check Gatekeeper NOW!
+                decision, probs = self.gk.evaluate_tick(
+                    ai_state=ai_state,
+                    history=history,
+                    slice_text=heard_text,
+                    interrupt_threshold=0.50
+                )
+                if decision == "INTERRUPT":
+                    return "ABORT_TTS_IMMEDIATELY"
+            return "CONTINUE_SPEAKING"
+
+        # -------------------------------------------------------------
+        # 2. TURN COMPLETION CHECK (600 ms Silence Debounce)
+        # -------------------------------------------------------------
+        if is_silence:
+            self.consecutive_silence_ticks += 1
+            # Require 2 ticks of 300ms silence (= 600ms total pause)
+            # This prevents jumping in during human breathing pauses!
+            if self.consecutive_silence_ticks >= 2:
+                decision, probs = self.gk.evaluate_tick(
+                    ai_state="IDLE",
+                    history=history,
+                    slice_text="<silence>",
+                    speak_threshold=0.70
+                )
+                if decision == "SPEAK":
+                    self.consecutive_silence_ticks = 0
+                    return "TRIGGER_LLM_TURN"
+        else:
+            # User is speaking words -> reset silence counter
+            self.consecutive_silence_ticks = 0
+
+        return "KEEP_LISTENING"
+```
+
+### Summary of Slicing Guidelines
+1. **Audio Frame Size**: 16 kHz, 16-bit Mono $\rightarrow$ **4,800 audio samples per 300 ms slice**.
+2. **Barge-in Reaction**: Trigger on **1 slice (300 ms)** with words for instant TTS cutoff.
+3. **Turn Completion**: Trigger on **2 slices (600 ms)** of silence to prevent cutting off breathing pauses.
+
+
