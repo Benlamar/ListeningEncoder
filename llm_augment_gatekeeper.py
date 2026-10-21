@@ -154,7 +154,44 @@ def call_openrouter(api_key: str, model: str, prompt: str) -> Dict[str, Any]:
         raise RuntimeError(f"OpenRouter HTTP {e.code}: {err_msg}")
 
 
+LABEL_STR_MAP = {
+    "LISTEN": 0, "0": 0, 0: 0,
+    "SPEAK": 1, "1": 1, 1: 1,
+    "FILLER": 2, "2": 2, 2: 2,
+    "INTERRUPT": 3, "3": 3, 3: 3
+}
+
+
 def parse_llm_json(raw_text: str) -> List[Dict[str, Any]]:
+    if not raw_text or not isinstance(raw_text, str):
+        return []
+
+    # 1. Try finding bracketed array [...]
+    start = raw_text.find("[")
+    end = raw_text.rfind("]")
+    if start != -1 and end != -1 and end > start:
+        snippet = raw_text[start:end+1].strip()
+        try:
+            res = json.loads(snippet)
+            if isinstance(res, list):
+                return res
+        except Exception:
+            pass
+
+    # 2. Try parsing individual {...} objects using regex
+    import re
+    items = []
+    for match in re.finditer(r'\{[^{}]+\}', raw_text):
+        try:
+            obj = json.loads(match.group(0))
+            if isinstance(obj, dict):
+                items.append(obj)
+        except Exception:
+            pass
+    if items:
+        return items
+
+    # 3. Fallback direct JSON loads
     clean = raw_text.strip()
     if clean.startswith("```json"):
         clean = clean[7:]
@@ -164,7 +201,6 @@ def parse_llm_json(raw_text: str) -> List[Dict[str, Any]]:
         clean = clean[:-3]
     clean = clean.strip()
 
-    # Sometimes models return {"data": [...]} or {"examples": [...]} or directly [...]
     try:
         parsed = json.loads(clean)
         if isinstance(parsed, list):
@@ -173,17 +209,10 @@ def parse_llm_json(raw_text: str) -> List[Dict[str, Any]]:
             for v in parsed.values():
                 if isinstance(v, list):
                     return v
-        return []
     except Exception:
-        # Fallback regex search for json list
-        start = clean.find("[")
-        end = clean.rfind("]")
-        if start != -1 and end != -1:
-            try:
-                return json.loads(clean[start:end+1])
-            except Exception:
-                pass
-        return []
+        pass
+
+    return []
 
 
 def main():
@@ -235,10 +264,10 @@ def main():
 
     # Task allocation: 40% Barge-In (Class 3), 30% Thinking Pause (Class 0), 15% SPEAK (Class 1), 15% FILLER (Class 2)
     tasks = [
-        ("BARGE_IN", PROMPT_BARGE_IN, int(needed * 0.40)),
-        ("THINKING_PAUSE", PROMPT_THINKING_PAUSE, int(needed * 0.30)),
-        ("TURN_COMPLETION", PROMPT_TURN_COMPLETION, int(needed * 0.15)),
-        ("BACKCHANNEL", PROMPT_BACKCHANNEL, int(needed * 0.15)),
+        ("BARGE_IN", PROMPT_BARGE_IN, int(needed * 0.40), 3),
+        ("THINKING_PAUSE", PROMPT_THINKING_PAUSE, int(needed * 0.30), 0),
+        ("TURN_COMPLETION", PROMPT_TURN_COMPLETION, int(needed * 0.15), 1),
+        ("BACKCHANNEL", PROMPT_BACKCHANNEL, int(needed * 0.15), 2),
     ]
 
     total_prompt_tokens = 0
@@ -250,7 +279,7 @@ def main():
     fout = open(args.output_file, "a", encoding="utf-8")
 
     try:
-        for task_name, template, task_target in tasks:
+        for task_name, template, task_target, default_label in tasks:
             print(f"\n>>> Starting Task: {task_name} (Goal: {task_target:,} samples)")
             task_generated = 0
 
@@ -283,17 +312,50 @@ def main():
                 # Parse choices
                 choices = resp.get("choices", [])
                 if not choices:
+                    print(f"  Warning: No choices returned in response: {resp}")
+                    time.sleep(2)
                     continue
-                content = choices[0].get("message", {}).get("content", "")
+
+                msg = choices[0].get("message", {})
+                content = msg.get("content") or msg.get("reasoning") or ""
+                if not content:
+                    print(f"  Warning: Received empty content from API choice: {choices[0]}")
+                    time.sleep(2)
+                    continue
+
                 items = parse_llm_json(content)
 
                 valid_items = 0
                 for item in items:
-                    text = item.get("text", "").strip()
-                    lbl = item.get("label", None)
-                    if text and lbl is not None and 0 <= int(lbl) <= 3:
-                        fout.write(json.dumps({"text": text, "label": int(lbl)}) + "\n")
+                    if not isinstance(item, dict):
+                        continue
+
+                    # Extract or construct text
+                    text = item.get("text") or item.get("prompt") or item.get("input") or ""
+                    if not text:
+                        ai_state = item.get("ai_state") or item.get("AI_State") or item.get("state") or ("IDLE" if default_label != 3 else "SPEAKING")
+                        history = item.get("history") or item.get("History") or ""
+                        slice_text = item.get("slice") or item.get("Slice") or "<silence>"
+                        if history and not history.startswith("User:"):
+                            history = f"User: {history}"
+                        text = f"AI_State: {ai_state} | History: {history} | Slice: {slice_text}"
+
+                    # Extract or infer label
+                    lbl = item.get("label")
+                    if lbl is None:
+                        lbl = item.get("Label")
+                    if lbl is not None:
+                        final_lbl = LABEL_STR_MAP.get(str(lbl).upper(), default_label)
+                    else:
+                        final_lbl = default_label
+
+                    if text.strip() and 0 <= final_lbl <= 3:
+                        fout.write(json.dumps({"text": text.strip(), "label": final_lbl}) + "\n")
                         valid_items += 1
+
+                if valid_items == 0:
+                    print(f"  [Debug] 0 items parsed from batch. Model returned:\n    {repr(content[:300])}")
+                    time.sleep(1)
 
                 fout.flush()
                 task_generated += valid_items
