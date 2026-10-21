@@ -45,6 +45,14 @@ def extract_words_from_deepgram_or_raw(data: Any) -> Tuple[List[Dict[str, Any]],
     words_b = []
 
     if isinstance(data, dict):
+        # Format 0: OpenYap 1K official schema: transcripts['a']['words'] & transcripts['b']['words']
+        transcripts = data.get("transcripts", {})
+        if isinstance(transcripts, dict) and "a" in transcripts and "b" in transcripts:
+            words_a = transcripts["a"].get("words", [])
+            words_b = transcripts["b"].get("words", [])
+            if words_a or words_b:
+                return words_a, words_b
+
         # Format A: Deepgram channels object
         channels = data.get("results", {}).get("channels", [])
         if len(channels) >= 2:
@@ -118,26 +126,56 @@ def process_dual_track_conv(user_words: List[Dict[str, Any]],
     user_words = [w for w in user_words if w.get("word") or w.get("punctuated_word")]
     ai_words = [w for w in ai_words if w.get("word") or w.get("punctuated_word")]
 
-    user_words.sort(key=lambda x: get_time(x, "start", 0.0))
-    ai_words.sort(key=lambda x: get_time(x, "start", 0.0))
-
     max_time = 0.0
     for w in user_words + ai_words:
         max_time = max(max_time, get_time(w, "end", 0.0))
 
+    if max_time <= 0:
+        return rows
+
+    num_ticks = int(max_time / tick_duration) + 1
+    u_tick_words = [[] for _ in range(num_ticks)]
+    a_tick_words = [[] for _ in range(num_ticks)]
+    u_active_ticks = [False] * num_ticks
+    a_active_ticks = [False] * num_ticks
+
+    # Fast O(N) pre-binning of words into ticks
+    for w in user_words:
+        w_text = (w.get("word") or w.get("punctuated_word") or "").strip()
+        start = get_time(w, "start", 0.0)
+        end = get_time(w, "end", 0.0)
+        mid = (start + end) / 2.0
+        mid_idx = int(mid / tick_duration)
+        if 0 <= mid_idx < num_ticks and w_text:
+            u_tick_words[mid_idx].append(w_text)
+        
+        s_idx = max(0, int(start / tick_duration))
+        e_idx = min(num_ticks, int(end / tick_duration) + 1)
+        for i in range(s_idx, e_idx):
+            u_active_ticks[i] = True
+
+    for w in ai_words:
+        w_text = (w.get("word") or w.get("punctuated_word") or "").strip()
+        start = get_time(w, "start", 0.0)
+        end = get_time(w, "end", 0.0)
+        mid = (start + end) / 2.0
+        mid_idx = int(mid / tick_duration)
+        if 0 <= mid_idx < num_ticks and w_text:
+            a_tick_words[mid_idx].append(w_text)
+
+        s_idx = max(0, int(start / tick_duration))
+        e_idx = min(num_ticks, int(end / tick_duration) + 1)
+        for i in range(s_idx, e_idx):
+            a_active_ticks[i] = True
+
     user_history = []
     ai_buffer = []
 
-    t = 0.0
-    while t < max_time:
-        t_next = t + tick_duration
-
-        # Words in this tick
-        u_tick = [w.get("word", "").strip() for w in user_words if t <= (get_time(w, "start", 0) + get_time(w, "end", 0)) / 2 < t_next and w.get("word", "").strip()]
-        a_tick = [w.get("word", "").strip() for w in ai_words if t <= (get_time(w, "start", 0) + get_time(w, "end", 0)) / 2 < t_next and w.get("word", "").strip()]
-
-        u_active = any(get_time(w, "start", 0) < t_next and get_time(w, "end", 0) > t for w in user_words)
-        a_active = any(get_time(w, "start", 0) < t_next and get_time(w, "end", 0) > t for w in ai_words)
+    for idx in range(num_ticks):
+        u_tick = u_tick_words[idx]
+        a_tick = a_tick_words[idx]
+        u_active = u_active_ticks[idx]
+        a_active = a_active_ticks[idx]
 
         if a_active:
             ai_str = "SPEAKING (AI: " + " ".join(ai_buffer[-10:]) + ")" if ai_buffer else "SPEAKING"
@@ -170,8 +208,6 @@ def process_dual_track_conv(user_words: List[Dict[str, Any]],
             ai_buffer.extend(a_tick)
         if not a_active:
             ai_buffer = []
-
-        t = t_next
 
     return rows
 
