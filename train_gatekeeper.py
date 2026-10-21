@@ -78,9 +78,12 @@ def compute_metrics(eval_pred):
     return metrics
 
 
-def calculate_class_weights(dataset_path: str, num_classes: int = 4) -> torch.Tensor:
+def calculate_class_weights(dataset_path: str, num_classes: int = 4, weight_power: float = 1.0) -> torch.Tensor:
     """
-    Calculates inverse class frequency weights from the training jsonl file.
+    Calculates class frequency weights from the training jsonl file.
+    weight_power=1.0: standard inverse frequency
+    weight_power=0.5: square-root smoothed (recommended for balanced/augmented data)
+    weight_power=0.0: unweighted (all 1.0)
     """
     counts = np.zeros(num_classes)
     total = 0
@@ -99,13 +102,16 @@ def calculate_class_weights(dataset_path: str, num_classes: int = 4) -> torch.Te
         pct = (counts[i] / total * 100) if total else 0
         print(f"  Class {i} ({name:<10}): {int(counts[i]):,} ({pct:.2f}%)")
         
-    # Inverse class frequency weighting: total / (num_classes * count)
-    counts = np.maximum(counts, 1.0)
-    weights = total / (num_classes * counts)
-    # Normalize weights so mean is 1.0
-    weights = weights / np.mean(weights)
+    if weight_power == 0.0:
+        weights = np.ones(num_classes)
+    else:
+        counts = np.maximum(counts, 1.0)
+        raw_weights = total / (num_classes * counts)
+        weights = raw_weights ** weight_power
+        # Normalize weights so mean is 1.0
+        weights = weights / np.mean(weights)
     
-    print("\nComputed Class Loss Weights (penalizes mistakes on rare classes):")
+    print(f"\nComputed Class Loss Weights (weight_power={weight_power}):")
     for i, name in enumerate(LABEL_NAMES):
         print(f"  Weight for {name:<10}: {weights[i]:.3f}")
         
@@ -125,6 +131,8 @@ def main():
     parser.add_argument("--max_length", type=int, default=160)
     parser.add_argument("--save_steps", type=int, default=500, help="Save a checkpoint every N steps")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--weight_power", type=float, default=0.7,
+                        help="Exponent for inverse frequency loss weighting (1.0=full inverse, 0.5=square root smoothed, 0.0=unweighted)")
     args = parser.parse_args()
 
     set_seed(args.seed)
@@ -135,7 +143,7 @@ def main():
         print(f"BF16 Supported: {torch.cuda.is_bf16_supported()}")
 
     # 1. Calculate loss weights
-    class_weights = calculate_class_weights(args.train_data, num_classes=4)
+    class_weights = calculate_class_weights(args.train_data, num_classes=4, weight_power=args.weight_power)
 
     # 2. Load Tokenizer & Model
     print(f"\nLoading model & tokenizer: {args.model_name}...")

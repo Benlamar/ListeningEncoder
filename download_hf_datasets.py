@@ -10,24 +10,35 @@ import argparse
 from huggingface_hub import hf_hub_download, snapshot_download
 
 HF_TARGET_DATASETS = [
-    {
-        "repo_id": "ASLP-lab/Easy-Turn-Testset",
-        "repo_type": "dataset",
-        "description": "Standardized evaluation set for turn-taking (complete, incomplete, backchannel, wait)",
-    },
+    # {
+    #     "repo_id": "ASLP-lab/Easy-Turn-Testset",
+    #     "repo_type": "dataset",
+    #     "description": "Standardized evaluation set for turn-taking (complete, incomplete, backchannel, wait)",
+    #     "ignore_patterns": ["*.wav", "*.mp3", "*.flac", "*.tar.gz"],
+    # },
     {
         "repo_id": "besimple-ai/duplex-cue",
         "repo_type": "dataset",
         "description": "In-turn adaptation and cue detection dataset for full-duplex agents",
+        "ignore_patterns": ["*.wav", "*.mp3", "*.flac", "*.tar.gz"],
+    },
+    {
+        "repo_id": "mrfakename/open-yap-1k",
+        "repo_type": "dataset",
+        "description": "Natural full-duplex conversational audio & Deepgram word alignments",
+        "ignore_patterns": ["preview/*.mp3"],  # Download metadata and sample archive
     }
 ]
 
 
-def download_dataset(repo_id: str, repo_type: str = "dataset", target_dir: str = "data/hf_downloads"):
+def download_dataset(repo_id: str, repo_type: str = "dataset", target_dir: str = "data/hf_downloads", ignore_patterns=None):
     clean_name = repo_id.replace("/", "_")
     dest_path = os.path.join(target_dir, clean_name)
     os.makedirs(dest_path, exist_ok=True)
     
+    if ignore_patterns is None:
+        ignore_patterns = ["*.wav", "*.mp3", "*.flac", "*.tar.gz"]
+
     print(f"\n[HuggingFace Download] Fetching: {repo_id} -> {dest_path}")
     try:
         # Download repository files ignoring large audio binaries if we only need metadata/transcripts
@@ -35,7 +46,7 @@ def download_dataset(repo_id: str, repo_type: str = "dataset", target_dir: str =
             repo_id=repo_id,
             repo_type=repo_type,
             local_dir=dest_path,
-            ignore_patterns=["*.wav", "*.mp3", "*.flac", "*.tar.gz"],  # Keep lightweight metadata & text
+            ignore_patterns=ignore_patterns,
             max_workers=4
         )
         print(f" Successfully fetched text/metadata to: {downloaded_dir}")
@@ -58,7 +69,7 @@ def main():
     else:
         for ds in HF_TARGET_DATASETS:
             print(f"Target: {ds['repo_id']} ({ds['description']})")
-            download_dataset(ds["repo_id"], ds["repo_type"], target_dir=args.dest)
+            download_dataset(ds["repo_id"], ds["repo_type"], target_dir=args.dest, ignore_patterns=ds.get("ignore_patterns"))
 
 
 if __name__ == "__main__":
